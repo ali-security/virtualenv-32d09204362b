@@ -75,13 +75,13 @@ if test -n __TCL_LIBRARY__
   if set -q TCL_LIBRARY;
     set -gx _OLD_VIRTUAL_TCL_LIBRARY $TCL_LIBRARY;
   end
-  set -gx TCL_LIBRARY '__TCL_LIBRARY__'
+  set -gx TCL_LIBRARY __TCL_LIBRARY__
 end
 if test -n __TK_LIBRARY__
   if set -q TK_LIBRARY;
     set -gx _OLD_VIRTUAL_TK_LIBRARY $TK_LIBRARY;
   end
-  set -gx TK_LIBRARY '__TK_LIBRARY__'
+  set -gx TK_LIBRARY __TK_LIBRARY__
 end
 
 # Prompt override provided?
