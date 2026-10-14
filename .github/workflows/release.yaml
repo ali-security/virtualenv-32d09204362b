@@ -1,7 +1,6 @@
 name: Release
 on:
-  push:
-    tags: ["*.*.*"]
+  workflow_dispatch:
 
 env:
   dists-artifact-name: python-package-distributions
@@ -9,6 +8,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -25,8 +25,14 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Python
         run: uv python install 3.14
+      - name: Pin build backend to the release-time version
+        run: echo "hatchling==1.30.1" > "${{ runner.temp }}/seal-build-constraints.txt"
       - name: Build sdist and wheel
         run: uv build --python 3.14 --python-preference only-managed --sdist --wheel . --out-dir dist
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: "21.5.1"
+          UV_EXCLUDE_NEWER: "2026-06-17T00:00:00Z"
+          UV_BUILD_CONSTRAINT: ${{ runner.temp }}/seal-build-constraints.txt
       - name: Build zipapp
         run: uv tool run --with tox-uv tox r -e zipapp
       - name: Store the distribution packages
@@ -42,7 +48,9 @@ jobs:
 
   publish:
     needs: build
+    if: false
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     environment:
       name: release
       url: https://pypi.org/project/virtualenv/${{ github.ref_name }}
@@ -88,11 +96,12 @@ jobs:
           git push origin main
 
   rollback:
-    if: ${{ always() && needs.build.result == 'success' && needs.publish.result == 'failure' }}
+    if: false
     needs:
       - build
       - publish
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     environment: release
     permissions:
       contents: write
