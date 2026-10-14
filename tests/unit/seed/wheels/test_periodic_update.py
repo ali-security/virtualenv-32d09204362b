@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ from io import StringIO
 from itertools import zip_longest
 from pathlib import Path
 from textwrap import dedent
+from typing import TYPE_CHECKING
 from urllib.error import URLError
 
 import pytest
@@ -21,6 +23,7 @@ from virtualenv.seed.wheels import Wheel
 from virtualenv.seed.wheels.embed import BUNDLE_SUPPORT, get_embed_wheel
 from virtualenv.seed.wheels.periodic_update import (
     NewVersion,
+    UnverifiedWheelError,
     UpdateLog,
     do_update,
     dump_datetime,
@@ -29,15 +32,30 @@ from virtualenv.seed.wheels.periodic_update import (
     periodic_update,
     release_date_for_wheel_path,
     trigger_update,
+    verify_wheel_digest,
 )
 from virtualenv.util.subprocess import CREATE_NO_WINDOW
 
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from unittest.mock import MagicMock
+
+    from pytest_mock import MockerFixture
+
 
 @pytest.fixture(autouse=True)  # noqa: RUF076
-def _clear_pypi_info_cache() -> None:
+def _clear_pypi_info_cache() -> Generator[None, None, None]:
     from virtualenv.seed.wheels.periodic_update import _PYPI_CACHE  # noqa: PLC0415
 
     _PYPI_CACHE.clear()
+    yield
+    # the mocked responses must not leak into later tests that verify real downloads in this process
+    _PYPI_CACHE.clear()
+
+
+@pytest.fixture
+def retry_sleep(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch("virtualenv.seed.wheels.periodic_update.sleep")
 
 
 def test_manual_upgrade(session_app_data, caplog, mocker, for_py_version) -> None:
@@ -543,6 +561,72 @@ def test_get_release_fails(mocker, caplog) -> None:
     assert result is None
     assert url_o.call_count == 1
     assert repr(exc) in caplog.text
+
+
+def _pypi_release_response(mocker, filename, digests, version="20.1"):
+    entry = {"filename": filename, "digests": digests}
+    body = json.dumps({"releases": {version: [entry]}})
+    return mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", return_value=StringIO(body))
+
+
+def test_verify_wheel_digest_matches(tmp_path, mocker) -> None:
+    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
+    wheel.path.write_bytes(b"content")
+    sha256 = hashlib.sha256(b"content").hexdigest()
+    _pypi_release_response(mocker, wheel.name, {"sha256": sha256})
+
+    verify_wheel_digest(wheel)  # must not raise
+
+
+def test_verify_wheel_digest_mismatch(tmp_path, mocker) -> None:
+    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
+    wheel.path.write_bytes(b"content")
+    _pypi_release_response(mocker, wheel.name, {"sha256": "0" * 64})
+
+    with pytest.raises(RuntimeError, match=r"has sha256 .* but PyPI reports"):
+        verify_wheel_digest(wheel)
+
+
+@pytest.mark.parametrize(
+    ("filename", "digests", "version"),
+    [
+        pytest.param("setuptools-99.0-py3-none-any.whl", {"sha256": "0" * 64}, "20.1", id="filename_not_in_release"),
+        pytest.param(
+            "pip-20.1-py3-none-any.whl", {"md5": "d41d8cd98f00b204e9800998ecf8427e"}, "20.1", id="no_sha256_digest"
+        ),
+        pytest.param("pip-20.1-py3-none-any.whl", {"sha256": "0" * 64}, "19.0", id="version_not_in_releases"),
+    ],
+)
+@pytest.mark.usefixtures("retry_sleep")
+def test_verify_wheel_digest_rejects_when_unverifiable(tmp_path, mocker, filename, digests, version) -> None:
+    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
+    wheel.path.write_bytes(b"content")
+    _pypi_release_response(mocker, filename, digests, version)
+
+    with pytest.raises(UnverifiedWheelError, match=r"could not obtain its sha256 from PyPI"):
+        verify_wheel_digest(wheel)
+
+
+def test_verify_wheel_digest_rejects_after_retrying_pypi_lookup(tmp_path, mocker, retry_sleep) -> None:
+    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
+    wheel.path.write_bytes(b"content")
+    mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", side_effect=URLError("offline"))
+
+    with pytest.raises(UnverifiedWheelError, match=r"could not obtain its sha256 from PyPI"):
+        verify_wheel_digest(wheel)
+
+    assert [entry.args for entry in retry_sleep.call_args_list] == [(1.0,), (2.0,), (4.0,)]
+
+
+@pytest.mark.usefixtures("retry_sleep")
+def test_verify_wheel_digest_recovers_on_retry(tmp_path, mocker) -> None:
+    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
+    wheel.path.write_bytes(b"content")
+    body = json.dumps({"releases": {"20.1": [{"filename": wheel.name, "digests": {"sha256": "0" * 64}}]}})
+    mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", side_effect=[URLError("offline"), StringIO(body)])
+
+    with pytest.raises(RuntimeError, match=r"has sha256 .* but PyPI reports 0{64}"):
+        verify_wheel_digest(wheel)
 
 
 def mock_download(mocker, pip_version_remote):
